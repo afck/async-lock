@@ -1,3 +1,4 @@
+use crate::atomic_static_location::{AtomicStaticLocation, Location};
 use core::borrow::Borrow;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -48,6 +49,9 @@ pub struct Mutex<T: ?Sized> {
     /// Lock operations waiting for the mutex to be released.
     lock_ops: Event,
 
+    /// The location of the caller that last took the mutex, if any.
+    location: AtomicStaticLocation,
+
     /// The value inside the mutex.
     data: UnsafeCell<T>,
 }
@@ -69,6 +73,7 @@ impl<T> Mutex<T> {
         Mutex {
             state: AtomicUsize::new(0),
             lock_ops: Event::new(),
+            location: AtomicStaticLocation::new(None),
             data: UnsafeCell::new(data),
         }
     }
@@ -85,6 +90,11 @@ impl<T> Mutex<T> {
     /// ```
     pub fn into_inner(self) -> T {
         self.data.into_inner()
+    }
+
+    /// Read the location of the lock holder, if any.
+    pub fn location(&self) -> Option<&'static Location> {
+        self.location.load(Ordering::Relaxed)
     }
 }
 
@@ -105,9 +115,11 @@ impl<T: ?Sized> Mutex<T> {
     /// # })
     /// ```
     #[inline]
+    #[track_caller]
     pub fn lock(&self) -> Lock<'_, T> {
         Lock::_new(LockInner {
             mutex: self,
+            location: Location::caller(),
             acquire_slow: None,
         })
     }
@@ -136,6 +148,7 @@ impl<T: ?Sized> Mutex<T> {
     /// ```
     #[cfg(all(feature = "std", not(target_family = "wasm")))]
     #[inline]
+    #[track_caller]
     pub fn lock_blocking(&self) -> MutexGuard<'_, T> {
         self.lock().wait()
     }
@@ -157,12 +170,15 @@ impl<T: ?Sized> Mutex<T> {
     /// # ;
     /// ```
     #[inline]
+    #[track_caller]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self
             .state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
         {
+            self.location
+                .store(Some(Location::caller()), Ordering::Relaxed);
             Some(MutexGuard(self))
         } else {
             None
@@ -221,9 +237,11 @@ impl<T: ?Sized> Mutex<T> {
     /// # })
     /// ```
     #[inline]
+    #[track_caller]
     pub fn lock_arc(self: &Arc<Self>) -> LockArc<T> {
         LockArc::_new(LockArcInnards::Unpolled {
             mutex: Some(self.clone()),
+            location: Location::caller(),
         })
     }
 
@@ -252,6 +270,7 @@ impl<T: ?Sized> Mutex<T> {
     /// ```
     #[cfg(all(feature = "std", not(target_family = "wasm")))]
     #[inline]
+    #[track_caller]
     pub fn lock_arc_blocking(self: &Arc<Self>) -> MutexGuardArc<T> {
         self.lock_arc().wait()
     }
@@ -274,12 +293,15 @@ impl<T: ?Sized> Mutex<T> {
     /// # ;
     /// ```
     #[inline]
+    #[track_caller]
     pub fn try_lock_arc(self: &Arc<Self>) -> Option<MutexGuardArc<T>> {
         if self
             .state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
         {
+            self.location
+                .store(Some(Location::caller()), Ordering::Relaxed);
             Some(MutexGuardArc(self.clone()))
         } else {
             None
@@ -328,6 +350,9 @@ pin_project_lite::pin_project! {
         // Reference to the mutex.
         mutex: &'a Mutex<T>,
 
+        // The location that is trying to take the mutex.
+        location: &'static Location,
+
         // The future that waits for the mutex to become available.
         #[pin]
         acquire_slow: Option<AcquireSlow<&'a Mutex<T>, T>>,
@@ -339,7 +364,7 @@ unsafe impl<T: Sync + ?Sized> Sync for Lock<'_, T> {}
 
 impl<T: ?Sized> fmt::Debug for LockInner<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Lock { .. }")
+        write!(f, "Lock {{ location:{:?} .. }}", self.location)
     }
 }
 
@@ -369,6 +394,9 @@ impl<'a, T: ?Sized> EventListenerFuture for LockInner<'a, T> {
             .as_pin_mut()
             .unwrap()
             .poll_with_strategy(strategy, context));
+        this.mutex
+            .location
+            .store(Some(this.location), Ordering::Relaxed);
         Poll::Ready(MutexGuard(this.mutex))
     }
 }
@@ -384,12 +412,13 @@ pin_project_lite::pin_project! {
     #[project = LockArcInnardsProj]
     enum LockArcInnards<T: ?Sized> {
         /// We have not tried to poll the fast path yet.
-        Unpolled { mutex: Option<Arc<Mutex<T>>> },
+        Unpolled { mutex: Option<Arc<Mutex<T>>>, location: &'static Location },
 
         /// We are acquiring the mutex through the slow path.
         AcquireSlow {
             #[pin]
-            inner: AcquireSlow<Arc<Mutex<T>>, T>
+            inner: AcquireSlow<Arc<Mutex<T>>, T>,
+            location: &'static Location,
         },
     }
 }
@@ -412,8 +441,9 @@ impl<T: ?Sized> EventListenerFuture for LockArcInnards<T> {
         context: &mut S::Context,
     ) -> Poll<Self::Output> {
         // Set the inner future if needed.
-        if let LockArcInnardsProj::Unpolled { mutex } = self.as_mut().project() {
+        if let LockArcInnardsProj::Unpolled { mutex, location } = self.as_mut().project() {
             let mutex = mutex.take().expect("mutex taken more than once");
+            let location = *location;
 
             // Try the fast path before trying to register slowly.
             if let Some(guard) = mutex.try_lock_arc() {
@@ -423,17 +453,20 @@ impl<T: ?Sized> EventListenerFuture for LockArcInnards<T> {
             // Set the inner future to the slow acquire path.
             self.as_mut().set(LockArcInnards::AcquireSlow {
                 inner: AcquireSlow::new(mutex),
+                location,
             });
         }
 
         // Poll the inner future.
-        let value = match self.project() {
-            LockArcInnardsProj::AcquireSlow { inner } => {
-                ready!(inner.poll_with_strategy(strategy, context))
-            }
+        let (value, location) = match self.project() {
+            LockArcInnardsProj::AcquireSlow { inner, location } => (
+                ready!(inner.poll_with_strategy(strategy, context)),
+                location,
+            ),
             _ => unreachable!(),
         };
 
+        value.location.store(Some(location), Ordering::Relaxed);
         Poll::Ready(MutexGuardArc(value))
     }
 }
