@@ -1,15 +1,17 @@
-use std::panic::Location;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+/// Alias for `std::panic::Location<'static>`.
+pub type Location = std::panic::Location<'static>;
+
 /// An atomic pointer on an optional static Location.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AtomicStaticLocation {
-    inner: AtomicPtr<Location<'static>>,
+    inner: AtomicPtr<Location>,
 }
 
 impl AtomicStaticLocation {
     /// Construct an [`AtomicStaticLocation`]
-    pub fn new(initial: Option<&'static Location<'static>>) -> Self {
+    pub const fn new(initial: Option<&'static Location>) -> Self {
         let initial = match initial {
             Some(r) => r as *const _ as *mut _,
             None => std::ptr::null_mut(),
@@ -19,13 +21,13 @@ impl AtomicStaticLocation {
     }
 
     /// Read the Location value atomically.
-    pub fn load(&self, ordering: Ordering) -> Option<&'static Location<'static>> {
+    pub fn load(&self, ordering: Ordering) -> Option<&'static Location> {
         let ptr = self.inner.load(ordering);
         unsafe { ptr.as_ref() }
     }
 
     /// Store a new Location value atomically.
-    pub fn store(&self, value: Option<&'static Location<'static>>, ordering: Ordering) {
+    pub fn store(&self, value: Option<&'static Location>, ordering: Ordering) {
         let value = match value {
             Some(r) => r as *const _ as *mut _,
             None => std::ptr::null_mut(),
@@ -36,9 +38,9 @@ impl AtomicStaticLocation {
     /// Swap the Location value atomically.
     pub fn swap(
         &self,
-        value: Option<&'static Location<'static>>,
+        value: Option<&'static Location>,
         ordering: Ordering,
-    ) -> Option<&'static Location<'static>> {
+    ) -> Option<&'static Location> {
         let new_ptr = match value {
             Some(r) => r as *const _ as *mut _,
             None => std::ptr::null_mut(),
@@ -51,14 +53,14 @@ impl AtomicStaticLocation {
 #[test]
 fn test_atomic_location() {
     #[track_caller]
-    fn get_caller_location() -> &'static Location<'static> {
+    fn get_caller_location() -> &'static Location {
         Location::caller()
     }
 
     let location1 = get_caller_location();
     let location2 = get_caller_location();
     assert_eq!(location1.file(), file!());
-    assert_eq!(location1.line(), 58);
+    assert_eq!(location1.line(), 60);
     assert_eq!(location1.column(), 21);
 
     let atomic_static_location = AtomicStaticLocation::new(Some(location1));
