@@ -92,7 +92,8 @@ impl<T> Mutex<T> {
         self.data.into_inner()
     }
 
-    /// Read the location of the lock holder, if any.
+    /// Read the location of the mutex holder, if any. This is meant for debugging
+    /// purposes only.
     pub fn location(&self) -> Option<&'static Location> {
         self.location.load(Ordering::Relaxed)
     }
@@ -214,6 +215,7 @@ impl<T: ?Sized> Mutex<T> {
     /// on the mutex will likely lead to UB.
     pub(crate) unsafe fn unlock_unchecked(&self) {
         // Remove the last bit and notify a waiting lock operation.
+        self.location.store(None, Ordering::Release);
         self.state.fetch_sub(1, Ordering::Release);
         self.lock_ops.notify(1);
     }
