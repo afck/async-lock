@@ -48,6 +48,7 @@ macro_rules! pin {
 }
 
 mod atomic_static_cstr;
+mod atomic_static_location;
 mod barrier;
 mod mutex;
 mod once_cell;
@@ -55,6 +56,7 @@ mod rwlock;
 mod semaphore;
 
 pub use atomic_static_cstr::AtomicStaticCStr;
+pub use atomic_static_location::AtomicStaticLocation;
 pub use barrier::{Barrier, BarrierWaitResult};
 pub use mutex::{Mutex, MutexGuard, MutexGuardArc};
 pub use once_cell::OnceCell;
