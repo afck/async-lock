@@ -92,7 +92,7 @@ impl<T> Mutex<T> {
         self.data.into_inner()
     }
 
-    /// Read the location of the mutex holder, if any. This is meant for debugging
+    /// Reads the location of the mutex holder, if any. This is meant for debugging
     /// purposes only.
     pub fn location(&self) -> Option<&'static Location> {
         self.location.load(Ordering::Relaxed)
@@ -118,6 +118,7 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> Lock<'_, T> {
+        println!("async-lock: Mutex::lock {:?}", Location::caller());
         Lock::_new(LockInner {
             mutex: self,
             location: Location::caller(),
@@ -178,8 +179,22 @@ impl<T: ?Sized> Mutex<T> {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
         {
+            println!("async-lock: Mutex::try_lock: {:?}", Location::caller());
             self.location
-                .store(Some(Location::caller()), Ordering::Relaxed);
+                .store(Some(Location::caller()), Ordering::Release);
+            Some(MutexGuard(self))
+        } else {
+            None
+        }
+    }
+
+    fn try_lock_internal(&self, location: &'static Location) -> Option<MutexGuard<'_, T>> {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
+        {
+            self.location.store(Some(location), Ordering::Release);
             Some(MutexGuard(self))
         } else {
             None
@@ -215,7 +230,10 @@ impl<T: ?Sized> Mutex<T> {
     /// on the mutex will likely lead to UB.
     pub(crate) unsafe fn unlock_unchecked(&self) {
         // Remove the last bit and notify a waiting lock operation.
-        self.location.store(None, Ordering::Release);
+        println!(
+            "async-lock: Mutex::unlock_unchecked {:?}",
+            self.location.swap(None, Ordering::Release)
+        );
         self.state.fetch_sub(1, Ordering::Release);
         self.lock_ops.notify(1);
     }
@@ -241,6 +259,7 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     #[track_caller]
     pub fn lock_arc(self: &Arc<Self>) -> LockArc<T> {
+        println!("async-lock: Mutex::lock_arc {:?}", Location::caller());
         LockArc::_new(LockArcInnards::Unpolled {
             mutex: Some(self.clone()),
             location: Location::caller(),
@@ -302,8 +321,26 @@ impl<T: ?Sized> Mutex<T> {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             .is_ok()
         {
+            println!("async-lock: Mutex::try_lock_arc {:?}", Location::caller());
             self.location
                 .store(Some(Location::caller()), Ordering::Relaxed);
+            Some(MutexGuardArc(self.clone()))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn try_lock_arc_internal(
+        self: &Arc<Self>,
+        location: &'static Location,
+    ) -> Option<MutexGuardArc<T>> {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+            .is_ok()
+        {
+            self.location.store(Some(location), Ordering::Release);
             Some(MutexGuardArc(self.clone()))
         } else {
             None
@@ -383,10 +420,14 @@ impl<'a, T: ?Sized> EventListenerFuture for LockInner<'a, T> {
 
         // This may seem weird, but the borrow checker complains otherwise.
         if this.acquire_slow.is_none() {
-            match this.mutex.try_lock() {
-                Some(guard) => return Poll::Ready(guard),
+            match this.mutex.try_lock_internal(this.location) {
+                Some(guard) => {
+                    println!("async-lock: acquired lock {:?}", this.location);
+                    return Poll::Ready(guard);
+                }
                 None => {
-                    this.acquire_slow.set(Some(AcquireSlow::new(this.mutex)));
+                    this.acquire_slow
+                        .set(Some(AcquireSlow::new(this.mutex, this.location)));
                 }
             }
         }
@@ -396,9 +437,6 @@ impl<'a, T: ?Sized> EventListenerFuture for LockInner<'a, T> {
             .as_pin_mut()
             .unwrap()
             .poll_with_strategy(strategy, context));
-        this.mutex
-            .location
-            .store(Some(this.location), Ordering::Relaxed);
         Poll::Ready(MutexGuard(this.mutex))
     }
 }
@@ -448,13 +486,13 @@ impl<T: ?Sized> EventListenerFuture for LockArcInnards<T> {
             let location = *location;
 
             // Try the fast path before trying to register slowly.
-            if let Some(guard) = mutex.try_lock_arc() {
+            if let Some(guard) = mutex.try_lock_arc_internal(location) {
                 return Poll::Ready(guard);
             }
 
             // Set the inner future to the slow acquire path.
             self.as_mut().set(LockArcInnards::AcquireSlow {
-                inner: AcquireSlow::new(mutex),
+                inner: AcquireSlow::new(mutex, location),
                 location,
             });
         }
@@ -489,6 +527,8 @@ pin_project_lite::pin_project! {
         // This lock operation is starving.
         starved: bool,
 
+        location: &'static Location,
+
         // Capture the `T` lifetime.
         #[pin]
         _marker: PhantomData<T>,
@@ -511,7 +551,7 @@ struct Start {
 impl<T: ?Sized, B: Borrow<Mutex<T>>> AcquireSlow<B, T> {
     /// Create a new `AcquireSlow` future.
     #[cold]
-    fn new(mutex: B) -> Self {
+    fn new(mutex: B, location: &'static Location) -> Self {
         // Create a new instance of the listener.
         let listener = {
             let mutex = Borrow::<Mutex<T>>::borrow(&mutex);
@@ -526,6 +566,7 @@ impl<T: ?Sized, B: Borrow<Mutex<T>>> AcquireSlow<B, T> {
                 start: None,
             },
             starved: false,
+            location,
             _marker: PhantomData,
         }
     }
@@ -561,9 +602,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
         let mutex = Borrow::<Mutex<T>>::borrow(
             this.mutex.as_ref().expect("future polled after completion"),
         );
+        let location = this.location;
 
         // Only use this hot loop if we aren't currently starved.
         if !*this.starved {
+            println!("Not starved: {:?}", location);
             loop {
                 // Start listening for events.
                 if !this.listener.is_listening() {
@@ -576,7 +619,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
                         .unwrap_or_else(|x| x)
                     {
                         // Lock acquired!
-                        0 => return Poll::Ready(self.take_mutex().unwrap()),
+                        0 => {
+                            mutex.location.store(Some(location), Ordering::Release);
+                            let mutex = self.take_mutex().unwrap();
+                            return Poll::Ready(mutex);
+                        }
 
                         // Lock is held and nobody is starved.
                         1 => {}
@@ -594,7 +641,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
                         .unwrap_or_else(|x| x)
                     {
                         // Lock acquired!
-                        0 => return Poll::Ready(self.take_mutex().unwrap()),
+                        0 => {
+                            mutex.location.store(Some(location), Ordering::Release);
+                            let mutex = self.take_mutex().unwrap();
+                            return Poll::Ready(mutex);
+                        }
 
                         // Lock is held and nobody is starved.
                         1 => {}
@@ -628,8 +679,10 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
         }
 
         // Fairer locking loop.
+        println!("Starved: {:?}", location);
         loop {
             if !this.listener.is_listening() {
+                println!("Starved not listening: {:?}", location);
                 // Start listening for events.
                 this.listener.as_mut().listen();
 
@@ -640,7 +693,11 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
                     .unwrap_or_else(|x| x)
                 {
                     // Lock acquired!
-                    2 => return Poll::Ready(self.take_mutex().unwrap()),
+                    2 => {
+                        mutex.location.store(Some(location), Ordering::Release);
+                        let mutex = self.take_mutex().unwrap();
+                        return Poll::Ready(mutex);
+                    }
 
                     // Lock is held by someone.
                     s if s % 2 == 1 => {}
@@ -652,12 +709,17 @@ impl<T: ?Sized, B: Unpin + Borrow<Mutex<T>>> EventListenerFuture for AcquireSlow
                     }
                 }
             } else {
+                println!("Starved listening: {:?}", location);
                 // Wait for a notification.
                 ready!(strategy.poll(this.listener.as_mut(), context));
+                println!("Done polling: {:?}", location);
 
                 // Try acquiring the lock without waiting for others.
                 if mutex.state.fetch_or(1, Ordering::Acquire) % 2 == 0 {
-                    return Poll::Ready(self.take_mutex().unwrap());
+                    println!("Acquiring: {:?}", location);
+                    mutex.location.store(Some(location), Ordering::Release);
+                    let mutex = self.take_mutex().unwrap();
+                    return Poll::Ready(mutex);
                 }
             }
         }
